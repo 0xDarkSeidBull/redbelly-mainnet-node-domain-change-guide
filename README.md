@@ -209,7 +209,7 @@ OLD_KEY=$(grep -oP -- '--tls\.key=\K\S+' "$UNIT")
 NEW_CERT="${OLD_CERT//$OLD/$NEW}"
 NEW_KEY="${OLD_KEY//$OLD/$NEW}"
 
-printf '%-10s %s' unit: "$UNIT" user: "$SVC_USER" old-cert: "$OLD_CERT" old-key: "$OLD_KEY" new-cert: "$NEW_CERT" new-key: "$NEW_KEY"
+printf '%-10s %s\n' unit: "$UNIT" user: "$SVC_USER" old-cert: "$OLD_CERT" old-key: "$OLD_KEY" new-cert: "$NEW_CERT" new-key: "$NEW_KEY"
 sudo ls -l "/etc/letsencrypt/live/$NEW/"
 ```
 
