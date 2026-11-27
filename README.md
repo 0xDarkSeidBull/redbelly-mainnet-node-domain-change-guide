@@ -1,435 +1,858 @@
-# Redbelly Node: Switch to a New Domain After Your Domain Expires (Without Resyncing)
-
-This guide is for Redbelly **mainnet** node operators whose node domain has expired (or is about to expire) and who want to move the node to a new domain **on the same VPS**.
-
-Your synced chain data stays as it is. After the restart, the node continues from the block where it stopped. The node is down for only about one minute.
-
-> [!NOTE]
-> This is a community guide, not an official Redbelly guide. It was tested in November 2026 on a node installed with the official `rbn-installer.run` (systemd service `redbelly.service`).
-
-## What changes and what doesn't
-
-| Item | Changes? |
-|---|---|
-| Synced chain data (`/opt/redbelly/rbn`) | No |
-| Node ID, keys, signing and reward addresses | No |
-| VPS IP and ports | No |
-| Hostname registered with Redbelly | Yes, through a support ticket |
-| TLS certificate | Yes, a new one for the new domain |
-| Certificate path in the service file, installer config and renewal hooks | Yes |
-
-## Before you start
-
-> [!WARNING]
-> - **Never run `sudo ./rbn-installer.run -- --uninstall`.** According to the Redbelly docs, it deletes all synced blocks.
-> - Do not delete or move the `--datadir` folder (usually `/opt/redbelly/rbn`).
-> - Never share your private key with anyone: not in the ticket, not on Discord, not with anyone helping you.
-
-- **Timing:** Redbelly nodes connect to each other with mutual TLS, which means every node checks the other node's certificate. In our test, support updated the hostname while the node was still using the old certificate. During that time the node got no response from any peer (the log showed `received 0 responses`). So don't switch before support replies, and don't wait after they reply. Do [Step 5](#step-5-switch-the-node-to-the-new-domain) as soon as the reply arrives.
-- **Governor nodes:** according to the Redbelly docs, a governor that is inactive for more than 5 minutes gets jailed and loses 20% of its stake. Planned downtime must be announced 3 days in advance. The node is down for only about a minute in this guide, but mention the restart in your ticket anyway.
-- **Scope:** this guide only covers changing the domain on the same VPS. If you are also moving to a new VPS or IP, this guide is not enough.
-
-## The whole process
-
-| Step | Task | Node downtime? |
-|---|---|---|
-| [0](#step-0-check-your-current-setup) | Check your current setup | No |
-| [1](#step-1-get-a-new-domain) | Get a new domain | No |
-| [2](#step-2-point-the-domain-to-your-vps-ip) | Point the domain to your VPS IP | No |
-| [3](#step-3-get-an-ssl-certificate-for-the-new-domain) | Get an SSL certificate for the new domain | No |
-| [4](#step-4-open-a-redbelly-support-ticket) | Open a Redbelly support ticket | No |
-| [5](#step-5-switch-the-node-to-the-new-domain) | After support replies, switch the node to the new domain | About 1 minute |
-| [6](#step-6-check-that-the-node-is-syncing) | Check that the node is syncing | No |
-| [7](#step-7-clean-up) | Clean up | No |
-
----
-
-## Step 0: Check your current setup
-
-SSH into your VPS and run this. It only prints information and changes nothing:
-
-```bash
-UNIT=$(systemctl show -p FragmentPath --value redbelly.service)
-echo "Service file: $UNIT"
-grep -oE -- '--(nodeId|datadir|tls\.cert|tls\.key)=[^ ]+' "$UNIT"
-sudo openssl x509 -noout -subject -enddate -in "$(grep -oP -- '--tls\.cert=\K\S+' "$UNIT")"
-echo "VPS IP: $(curl -s -4 ifconfig.me)"
-```
-
-The output looks like this:
-
-```text
-Service file: /etc/systemd/system/redbelly.service
---datadir=/opt/redbelly/rbn
---nodeId=123
---tls.cert=/etc/redbelly/certs/old-domain.xyz/fullchain.pem
---tls.key=/etc/redbelly/certs/old-domain.xyz/privkey.pem
-subject=CN = old-domain.xyz
-notAfter=Jan 30 02:43:22 2027 GMT
-VPS IP: 203.0.113.10
-```
-
-Note down:
-
-- `--nodeId`: your Node ID. You need it for the ticket.
-- `subject=CN = ...`: your old domain.
-- `--datadir`: your synced data. Never touch this folder.
-- `VPS IP`: you need it for DNS and for the ticket.
-
-> [!IMPORTANT]
-> This guide is for setups where the `--tls.cert` path starts with `/etc/redbelly/certs/`. The official installer creates this setup. If your path is different, read [Other setups](#other-setups) first.
-
----
-
-## Step 1: Get a new domain
-
-**First, check whether you can still renew the old domain.** Most registrars let you renew a domain for some time after it expires. This is called the grace period, and its length depends on the registrar. If you can renew, that is the easiest option: no ticket, no commands, no restart. After renewing, run `getent hosts old-domain.xyz` and check that the domain shows your VPS IP again.
-
-**If you need a new domain:**
-
-- Buy it from any registrar, such as Namecheap, GoDaddy, Hostinger, Porkbun or Cloudflare.
-- Check the **renewal price** before you buy. Many domain extensions are cheap in the first year and expensive after that.
-- Turn **auto-renew on** so this doesn't happen again.
-- Both a root domain (`mynode.com`) and a subdomain (`rbn.mynode.com`) work.
-
----
-
-## Step 2: Point the domain to your VPS IP
-
-In your registrar's DNS panel (or in Cloudflare, if your DNS is there), create this record:
-
-| Type | Host / Name | Value | TTL |
-|---|---|---|---|
-| A | `@` (for a subdomain, its name, such as `rbn`) | Your VPS IP | Automatic or 300–600 |
-
-- Remove any old A or AAAA records for the same host, such as parking page records. If a wrong AAAA record is left, Let's Encrypt may check over IPv6 and the certificate request can fail.
-- **Cloudflare:** keep the proxy OFF (grey cloud, "DNS only"). With the proxy on, the domain resolves to a Cloudflare IP and traffic on ports 1888/1111 never reaches your node.
-
-Now check from the VPS. DNS changes can take from a few minutes up to 24 hours.
-
-```bash
-NEW=new-domain.com
-getent ahosts "$NEW" | awk '{print $1}' | sort -u
-curl -s -4 ifconfig.me; echo
-```
-
-The first command should show only your VPS IP, and it should match the IP from the second command. If you also added an AAAA record for your VPS's IPv6 address, that address will show up too. That's fine.
-
-Ports 80 (for the certificate), 1888 and 1111 must be open in the firewall. This is normally done during installation. To check, run `sudo ufw status`.
-
----
-
-## Step 3: Get an SSL certificate for the new domain
-
-The node doesn't use port 80, so it keeps running during this step.
-
-First, check what is running on port 80:
-
-```bash
-sudo ss -ltnp | grep ':80 '
-```
-
-**If nothing shows up (port 80 is free):**
-
-```bash
-NEW=new-domain.com
-EMAIL=you@example.com
-sudo certbot certonly --standalone -d "$NEW" --non-interactive --agree-tos -m "$EMAIL"
-```
-
-**If you see `caddy`, `nginx` or `apache2`:** certbot has to stop that service for a few seconds while it gets the certificate. Put your service name in `SVC`:
-
-```bash
-NEW=new-domain.com
-EMAIL=you@example.com
-SVC=caddy
-sudo certbot certonly --standalone -d "$NEW" --non-interactive --agree-tos -m "$EMAIL" \
-  --pre-hook "systemctl stop $SVC" --post-hook "systemctl start $SVC"
-```
-
-Certbot saves these hooks, so every auto-renewal does the same. If port 80 is used by a Docker container (`ss` shows `docker-proxy`), use `docker stop <container>` and `docker start <container>` in the hooks instead.
-
-When the certificate is issued, you will see:
-
-```text
-Successfully received certificate.
-Certificate is saved at: /etc/letsencrypt/live/new-domain.com/fullchain.pem
-Key is saved at:         /etc/letsencrypt/live/new-domain.com/privkey.pem
-```
-
-- If you get `certbot: command not found`, install certbot first: `sudo apt update && sudo apt install -y certbot`
-- If you see `Hook 'post-hook' reported error code 1` together with `Successfully received certificate`, the certificate is fine. Your other service (for example Caddy) just failed to start again. See [Troubleshooting](#troubleshooting).
-
----
-
-## Step 4: Open a Redbelly support ticket
-
-Open a ticket on Redbelly's **Node Operator Support Portal**. It's the same portal where you registered your node, and the link is in Redbelly's onboarding email. You can also get help in the node operator channel on Redbelly's Discord.
-
-Send this message with your details filled in:
-
-```text
-Subject: Hostname change for Node ID <YOUR_NODE_ID>
-
-Hi team,
-
-My node (Node ID: <YOUR_NODE_ID>) is registered with hostname <OLD_DOMAIN>.
-That domain has expired, so I have moved to <NEW_DOMAIN>, which points to the
-same server IP <YOUR_VPS_IP>. Ports, vote/signing address and reward address
-are unchanged.
-
-Please update the registered hostname for my node to <NEW_DOMAIN> and let me
-know when it is done, so I can switch my node to the new certificate. The
-switch needs a restart of about 1 minute.
-
-Thanks
-```
-
-As soon as support replies that the hostname has been updated, do Step 5.
-
----
-
-## Step 5: Switch the node to the new domain
-
-> [!IMPORTANT]
-> Only do this step **after** support replies that the hostname has been updated. Run 5.1 to 5.3 in the same SSH window, because the variables set in 5.1 are used in the later steps.
-
-### 5.1 Set the variables and check the paths
-
-Put your domains in the first 2 lines only, without `https://` and without a trailing `/`:
-
-```bash
-OLD=old-domain.xyz
-NEW=new-domain.com
-
-UNIT=$(systemctl show -p FragmentPath --value redbelly.service)
-SVC_USER=$(systemctl show -p User --value redbelly.service); SVC_USER=${SVC_USER:-root}
-OLD_CERT=$(grep -oP -- '--tls\.cert=\K\S+' "$UNIT")
-OLD_KEY=$(grep -oP -- '--tls\.key=\K\S+' "$UNIT")
-NEW_CERT="${OLD_CERT//$OLD/$NEW}"
-NEW_KEY="${OLD_KEY//$OLD/$NEW}"
-
-printf '%-10s %s\n' unit: "$UNIT" user: "$SVC_USER" old-cert: "$OLD_CERT" old-key: "$OLD_KEY" new-cert: "$NEW_CERT" new-key: "$NEW_KEY"
-sudo ls -l "/etc/letsencrypt/live/$NEW/"
-```
-
-The output should look like this:
-
-```text
-unit:      /etc/systemd/system/redbelly.service
-user:      rbnuser
-old-cert:  /etc/redbelly/certs/old-domain.xyz/fullchain.pem
-old-key:   /etc/redbelly/certs/old-domain.xyz/privkey.pem
-new-cert:  /etc/redbelly/certs/new-domain.com/fullchain.pem
-new-key:   /etc/redbelly/certs/new-domain.com/privkey.pem
-```
-
-Below that, the `ls` listing should show `fullchain.pem` and `privkey.pem`.
-
-Continue only if:
-
-- `old-cert` and `old-key` both start with `/etc/redbelly/certs/`
-- `new-cert` and `new-key` contain your new domain
-- the `ls` listing shows `fullchain.pem` and `privkey.pem`
-
-If your paths don't contain the domain name at all (for example `/etc/redbelly/certs/fullchain.pem`), `new-cert` and `old-cert` will be the same. That works too, because 5.2 will replace the old files with the new certificate. In that case, check whether a script in `/etc/letsencrypt/renewal-hooks/` copies the certificate to `/etc/redbelly/certs/` after each renewal. If none does, you have to copy it yourself after every renewal, as the Redbelly docs describe.
-
-### 5.2 Back up, install the new certificate and update the paths
-
-The node does not restart in this step. Paste the whole block at once:
-
-```bash
-# 1) Backup: service file, /etc/redbelly (keys + config), renewal hooks. Chain data is not included.
-BACKUP=/root/rbn-backup-$(date +%F-%H%M)
-sudo mkdir -p "$BACKUP"
-sudo cp -a "$UNIT" /etc/redbelly "$BACKUP"/
-[ -d /etc/letsencrypt/renewal-hooks ] && sudo cp -a /etc/letsencrypt/renewal-hooks "$BACKUP"/
-echo "Backup: $BACKUP"
-
-# 2) Copy the new certificate into Redbelly's cert folder, with the same owner and permissions as the old files
-sudo mkdir -p "$(dirname "$NEW_CERT")"
-sudo cp -L "/etc/letsencrypt/live/$NEW/fullchain.pem" "$NEW_CERT"
-sudo cp -L "/etc/letsencrypt/live/$NEW/privkey.pem" "$NEW_KEY"
-sudo chown --reference="$(dirname "$OLD_CERT")" "$(dirname "$NEW_CERT")"
-sudo chmod --reference="$(dirname "$OLD_CERT")" "$(dirname "$NEW_CERT")"
-sudo chown --reference="$OLD_CERT" "$NEW_CERT"; sudo chmod --reference="$OLD_CERT" "$NEW_CERT"
-sudo chown --reference="$OLD_KEY" "$NEW_KEY"; sudo chmod --reference="$OLD_KEY" "$NEW_KEY"
-
-# 3) Replace the old domain with the new one in every file that contains it
-FILES=$(sudo grep -rlI --exclude-dir=certs "$OLD" "$UNIT" /etc/redbelly /etc/letsencrypt/renewal-hooks 2>/dev/null)
-echo "Files to update:"; echo "$FILES"
-[ -n "$FILES" ] && sudo sed -i "s|$OLD|$NEW|g" $FILES
-
-# 4) Check
-echo "---- CHECK ----"
-sudo openssl x509 -noout -subject -enddate -in "$NEW_CERT"
-sudo -u "$SVC_USER" cat "$NEW_KEY" >/dev/null && echo "KEY READ: OK" || echo "KEY READ: PROBLEM"
-grep -oE -- '--tls\.(cert|key)=[^ ]+' "$UNIT"
-sudo grep -rnI --exclude-dir=certs "$OLD" "$UNIT" /etc/redbelly /etc/letsencrypt/renewal-hooks 2>/dev/null || echo "OLD DOMAIN LEFT: none"
-```
-
-On a setup made by the official installer, the updated files look something like this (your list may differ slightly):
-
-```text
-/etc/systemd/system/redbelly.service
-/etc/redbelly/rbninstaller-config
-/etc/letsencrypt/renewal-hooks/post/redbelly.sh
-/etc/letsencrypt/renewal-hooks/deploy/redbelly-cert.sh
-```
-
-`rbninstaller-config` is the installer's settings file. It gets updated too, so that a future upgrade with the installer doesn't bring back the old path. The renewal hooks are updated so that after each renewal, the new certificate keeps getting copied to Redbelly's cert folder automatically.
-
-Under `---- CHECK ----` you should see:
-
-- `subject=CN = new-domain.com`
-- `KEY READ: OK`
-- the new domain in both `--tls.cert=` and `--tls.key=`
-- `OLD DOMAIN LEFT: none`
-
-If anything is different, don't restart the node. Check [Troubleshooting](#troubleshooting) first.
-
-### 5.3 Restart the node
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart redbelly.service
-sleep 60
-sudo systemctl status redbelly.service --no-pager | head -5
-sudo tail -n 20 /var/log/redbelly/rbn_logs/rbbc_logs.log
-sudo tail -n 10 /var/log/redbelly/rbn_logs/rbbc_logs_error.log
-```
-
-What to look for in the output:
-
-- `Active: active (running)`.
-- `current local block <N>` in the log, where N is a large number, not 0. The node continues syncing from this block. Example (your numbers will differ):
-  ```text
-  msg="Skipping download request ID 4 (range 3278304-3278304, is superblock false) with current local block 3278304 and superblock 2523450, ..."
-  ```
-- You may see `Node <ID> is changing from governor to candidate` and `Changed to candidate`. This means your node is not in the current governor list, so it runs as a candidate. Candidate nodes also keep the full chain in sync.
-- If the error log only has warnings like `Flag --statusserver.addr has been deprecated`, everything is fine.
-
----
-
-## Step 6: Check that the node is syncing
-
-**Compare the node's block with the network's block:**
-
-```bash
-sudo grep -oE "(current local block|from) [0-9]{7,}" /var/log/redbelly/rbn_logs/rbbc_logs.log | tail -2
-curl -s -X POST -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
-  https://governors.mainnet.redbelly.network \
-  | python3 -c "import sys,json; print('network block:', int(json.load(sys.stdin)['result'],16))"
-```
-
-The two numbers should be close. New blocks arrive slowly on mainnet (about one every 2 minutes in our test), so a difference of a few blocks is normal. Run the commands again after 10–15 minutes. The node's number should keep moving up with the network.
-
-**Check the certificate from outside:**
-
-```bash
-NEW=new-domain.com
-echo | openssl s_client -connect "$NEW:1111" -servername "$NEW" 2>/dev/null | openssl x509 -noout -subject -enddate
-```
-
-The output should show `subject=CN = new-domain.com`. The node asks for a client certificate, so the connection closes right away. That's expected.
-
----
-
-## Step 7: Clean up
-
-Once the node is syncing properly, delete the old domain's certbot certificate. Replace `old-domain.xyz` with your old domain and press `Y` when asked:
-
-```bash
-sudo certbot delete --cert-name old-domain.xyz
-```
-
-If you skip this, certbot will try to renew the dead domain twice a day once the old certificate gets close to expiry, and it runs the renewal hooks on every attempt.
-
-After a few days without problems, you can also remove:
-
-- The old cert folder: `sudo rm -r /etc/redbelly/certs/old-domain.xyz`
-- The backup from step 5.2 (`/root/rbn-backup-...`). It contains a copy of your private keys, so either keep it somewhere safe or delete it.
-
----
-
-## Troubleshooting
-
-**Certbot: `Could not bind TCP port 80 because it is already in use`**
-
-Another service is using port 80. Use the command with hooks from Step 3.
-
-**Certbot: `DNS problem: NXDOMAIN`, `unauthorized` or `Timeout during connect`**
-
-Common causes: the domain doesn't point to your VPS IP yet, there's a wrong AAAA record, the Cloudflare proxy is on, or port 80 is closed in the firewall (`sudo ufw allow 80`). Go through Step 2 again.
-
-**`Hook 'post-hook' reported error code 1` / `Job for caddy.service failed`**
-
-You got the certificate. The problem is in your other service, which failed to start because of an error in its own config. To see why:
-
-```bash
-sudo journalctl -u caddy -n 30 --no-pager
-```
-
-Example: `ambiguous site definition: example.com` means that site is defined twice in the Caddyfile. Remove one of the two blocks, then run:
-
-```bash
-sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl start caddy
-```
-
-**Log shows `received 0 responses to get indices during block sync, but need at least N`**
-
-The node gets no response from any peer. This is what you see after support has updated the hostname while the node still uses the old certificate. Do Step 5. If the message is still there after Step 5, run the CHECK from 5.2 again (in a new SSH session, run 5.1 first) and wait a few minutes. If it still doesn't recover, contact support and include the log.
-
-**The node doesn't start, or the CHECK shows `KEY READ: PROBLEM`**
-
-The user the node runs as (for example `rbnuser`) can't read the new key. Run the `chown`/`chmod --reference` lines from 5.2 again, then restart.
-
-**Support says "try syncing from the beginning"**
-
-Run the checks above first. Problems after a domain change usually come from the certificate or the config. A resync from 0 would use the same certificate and config, so the problem would stay. Only resync if support confirms that your data is corrupted.
-
-### Other setups
-
-Older manual setups (for example the `observe.sh` setups from the devnet days) may point straight to `/etc/letsencrypt/live/<domain>/`, and may also have the domain in `config.yaml`. The approach is the same:
-
-1. Get the new certificate with Step 3.
-2. Find the files that contain the old domain, such as the service file, a start script or `config.yaml`:
-   ```bash
-   sudo grep -rnI --exclude-dir={rbn,database,chaindata} "old-domain.xyz" /etc /root /home 2>/dev/null
-   ```
-   Replace the old domain with the new one in those files.
-3. Make sure the user the node runs as can read the new key.
-4. Restart the node and check it with Step 6.
-
-If you're not sure, ask on Redbelly's Discord before you continue.
-
----
-
-## Rollback
-
-If a file got broken during 5.2, restore the backup. The backup folder name was printed after `Backup:` in the 5.2 output.
-
-```bash
-BACKUP=/root/rbn-backup-YYYY-MM-DD-HHMM
-sudo cp -a "$BACKUP"/redbelly.service /etc/systemd/system/redbelly.service
-sudo cp -a "$BACKUP"/redbelly/. /etc/redbelly/
-sudo cp -a "$BACKUP"/renewal-hooks/. /etc/letsencrypt/renewal-hooks/
-sudo systemctl daemon-reload && sudo systemctl restart redbelly.service
-```
-
-Keep in mind: support has already updated the hostname, so going back to the old certificate will not make the node sync. Rollback is only for fixing a broken file. The real fix is the new certificate.
-
----
-
-## Next time
-
-- Keep auto-renew on at your registrar, and keep your payment method valid.
-- Put the domain's expiry date in your calendar.
-- Certbot renews the SSL certificate automatically, but you have to renew the domain yourself.
-
-## References
-
-- Redbelly docs: [Setup (DNS, firewall, uninstall)](https://vine.redbelly.network/nodes/operator-guide/setup/), [Start (certificates)](https://vine.redbelly.network/nodes/operator-guide/start/), [Verify (service and logs)](https://vine.redbelly.network/nodes/operator-guide/verify/), [Governance (jail rules)](https://vine.redbelly.network/nodes/governance/), [Governor requirements](https://vine.redbelly.network/nodes/reconfiguration/)
-- Redbelly mainnet RPC: `https://governors.mainnet.redbelly.network` (chain ID 151)
-- [Certbot user guide](https://eff-certbot.readthedocs.io/en/stable/using.html)
+#!/usr/bin/env bash
+# switch-domain.sh: move a Redbelly mainnet node to a new domain without resyncing.
+# Guide: https://github.com/0xDarkSeidBull/redbelly-mainnet-node-domain-change-guide
+#
+#   sudo bash switch-domain.sh check  NEW_DOMAIN          read-only report, changes nothing
+#   sudo bash switch-domain.sh cert   NEW_DOMAIN [EMAIL]  get the SSL certificate (node keeps running)
+#   sudo bash switch-domain.sh apply  NEW_DOMAIN          switch the node (only after Redbelly support confirms)
+#   sudo bash switch-domain.sh status NEW_DOMAIN          service, certificate and sync status
+#
+# The script never touches the chain data and never prints private keys.
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "Run this script with bash: sudo bash switch-domain.sh ..."
+  exit 1
+fi
+set -u
+umask 077
+
+VERSION=2026-11-24
+SERVICE=redbelly.service
+RB_ETC=/etc/redbelly
+LE=/etc/letsencrypt
+BACKUP_ROOT=/root
+HOME_DIRS="/root /home"
+DEFAULT_LOG=/var/log/redbelly/rbn_logs/rbbc_logs.log
+RPC_URL=https://governors.mainnet.redbelly.network
+TLS_PORT=1111
+CERTS_ROOT=$RB_ETC/certs
+
+FAILS=0
+TODOS=0
+ok()      { echo "  OK    $*"; }
+warn()    { echo "  WARN  $*"; }
+bad()     { echo "  FAIL  $*"; FAILS=$((FAILS + 1)); }
+todo()    { echo "  TODO  $*"; TODOS=$((TODOS + 1)); }
+note()    { echo "        $*"; }
+section() { echo; echo "== $* =="; }
+die()     { echo; echo "STOPPED: $*"; exit 1; }
+have()    { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  echo "Usage:"
+  echo "  sudo bash switch-domain.sh check  NEW_DOMAIN          read-only report, changes nothing"
+  echo "  sudo bash switch-domain.sh cert   NEW_DOMAIN [EMAIL]  get the SSL certificate (node keeps running)"
+  echo "  sudo bash switch-domain.sh apply  NEW_DOMAIN          switch the node (only after Redbelly support confirms)"
+  echo "  sudo bash switch-domain.sh status NEW_DOMAIN          service, certificate and sync status"
+  exit 1
+}
+
+# ---------- domain names ----------
+
+normalize_domain() {
+  local d=${1,,}
+  d=${d#http://}
+  d=${d#https://}
+  d=${d%%/*}
+  d=${d%%:*}
+  d=${d%.}
+  printf '%s' "$d"
+}
+
+valid_domain() {
+  local re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+  [[ $1 =~ $re ]] && ! [[ $1 =~ ^[0-9.]+$ ]]
+}
+
+# ---------- certificates ----------
+
+cert_matches() { # file domain
+  local out
+  out=$(openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null)
+  [[ $out == *"does match"* ]]
+}
+cert_valid() { openssl x509 -in "$1" -noout -checkend "${2:-0}" >/dev/null 2>&1; }
+cert_end()   { openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2; }
+cert_cn()    { openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null | awk -F'CN=' 'NF > 1 { print $2 }' | cut -d, -f1; }
+key_matches() { # cert key
+  local a b
+  a=$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null)
+  b=$(openssl pkey -in "$2" -pubout 2>/dev/null)
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+
+can_read_as() { # user file
+  if [ "$1" = root ]; then [ -r "$2" ]; return; fi
+  if have runuser; then runuser -u "$1" -- test -r "$2" 2>/dev/null; return; fi
+  if have sudo; then sudo -n -u "$1" test -r "$2" 2>/dev/null; return; fi
+  return 1
+}
+
+# ---------- replacing the old domain in files ----------
+
+# Replaces OLD_X with NEW_X only where it is a whole domain name, never inside a
+# longer name such as sub.old-domain.xyz or myold-domain.xyz. Exit 0 = changed.
+REPLACE_AWK='
+BEGIN { o = ENVIRON["OLD_X"]; n = ENVIRON["NEW_X"]; lo = length(o); changed = 0 }
+{
+  s = $0; out = ""
+  while (lo > 0 && (i = index(s, o)) > 0) {
+    before = out substr(s, 1, i - 1)
+    pc = substr(before, length(before), 1)
+    nc = substr(s, i + lo, 1)
+    if (pc !~ /[A-Za-z0-9.-]/ && nc !~ /[A-Za-z0-9-]/) { out = before n; changed = 1 }
+    else out = before o
+    s = substr(s, i + lo)
+  }
+  print out s
+}
+END { if (changed) exit 0; exit 3 }'
+
+replace_in_string() { printf '%s' "$1" | OLD_X=$OLD NEW_X=$NEW awk "$REPLACE_AWK"; }
+
+would_change() { # file
+  [ -n "$OLD" ] || return 1
+  grep -qIF -- "$OLD" "$1" 2>/dev/null || return 1
+  OLD_X=$OLD NEW_X=$NEW awk "$REPLACE_AWK" "$1" >/dev/null 2>&1
+}
+
+# ---------- reading the service file ----------
+
+# Value of --NAME=value or --NAME value; quotes removed; last one wins.
+FLAG_AWK='
+$1 ~ /^[#;]/ { next }
+{
+  for (i = 1; i <= NF; i++) {
+    t = $i; gsub(q, "", t); gsub(dq, "", t)
+    if (index(t, name "=") == 1) v = substr(t, length(name) + 2)
+    else if (t == name && i < NF) { v = $(i + 1); gsub(q, "", v); gsub(dq, "", v) }
+  }
+}
+END { if (v != "") print v }'
+
+flag_value() { cat "${UNIT_FILES[@]}" 2>/dev/null | awk -v name="--$1" -v q="'" -v dq='"' "$FLAG_AWK"; }
+
+unit_log() { # StandardOutput or StandardError
+  cat "${UNIT_FILES[@]}" 2>/dev/null | grep -E "^[[:space:]]*$1=(append|file|truncate):" | tail -n 1 | cut -d: -f2- | awk '{ print $1 }'
+}
+
+read_setup() {
+  UNIT=$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null)
+  if [ -z "$UNIT" ] || [ ! -f "$UNIT" ]; then
+    bad "$SERVICE was not found on this server"
+    note "This script is for nodes installed with the official Redbelly installer (rbn-installer.run)."
+    return 1
+  fi
+  UNIT_FILES=("$UNIT")
+  local f
+  for f in $(systemctl show -p DropInPaths --value "$SERVICE" 2>/dev/null); do
+    [ -f "$f" ] && UNIT_FILES+=("$f")
+  done
+  SVC_USER=$(systemctl show -p User --value "$SERVICE" 2>/dev/null)
+  SVC_USER=${SVC_USER:-root}
+  SVC_GROUP=$(systemctl show -p Group --value "$SERVICE" 2>/dev/null)
+  [ -n "$SVC_GROUP" ] || SVC_GROUP=$(id -gn "$SVC_USER" 2>/dev/null || echo root)
+  CUR_CERT=$(flag_value tls.cert)
+  CUR_KEY=$(flag_value tls.key)
+  NODE_ID=$(flag_value nodeId)
+  DATADIR=$(flag_value datadir)
+  LOG=$(unit_log StandardOutput)
+  LOG=${LOG:-$DEFAULT_LOG}
+  ERRLOG=$(unit_log StandardError)
+  ERRLOG=${ERRLOG:-${DEFAULT_LOG%.log}_error.log}
+  CUR_CN=""
+  if [ -n "$CUR_CERT" ] && [ -r "$CUR_CERT" ]; then CUR_CN=$(cert_cn "$CUR_CERT"); fi
+  return 0
+}
+
+show_setup() {
+  ok "Service file: $UNIT"
+  note "Node ID ${NODE_ID:-unknown}, runs as user $SVC_USER"
+  note "Chain data: ${DATADIR:-unknown} (this script never touches it)"
+  if [ -z "$CUR_CERT" ]; then
+    bad "The service file has no --tls.cert setting"
+  elif [ -n "$CUR_CN" ]; then
+    ok "Current certificate: $CUR_CN, valid until $(cert_end "$CUR_CERT")"
+    note "$CUR_CERT"
+  else
+    warn "The certificate file the service file points to is missing: $CUR_CERT"
+  fi
+}
+
+# ---------- DNS ----------
+
+PUBLIC_IP_CACHE=""
+public_ip() {
+  local url ip
+  [ -n "$PUBLIC_IP_CACHE" ] && { printf '%s' "$PUBLIC_IP_CACHE"; return 0; }
+  for url in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+    ip=$(curl -4 -fsS --max-time 6 "$url" 2>/dev/null | head -n 1 | tr -d ' ')
+    if [[ $ip =~ ^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+      PUBLIC_IP_CACHE=$ip
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+SERVER_IP=""
+check_dns() { # domain
+  local d=$1 a4 a6 mine pub="" ip good="" other="" rest="" v6other=""
+  a4=$(getent ahostsv4 "$d" 2>/dev/null | awk '{ print $1 }' | sort -u)
+  a6=$(getent ahostsv6 "$d" 2>/dev/null | awk '{ print $1 }' | grep -v '^::ffff:' | sort -u)
+  mine=" $(hostname -I 2>/dev/null) "
+  if [ -z "$a4" ]; then
+    bad "$d has no A record yet, or DNS has not updated yet"
+    note "Create an A record for $d that points to this server, wait a few minutes, then run this again."
+    return
+  fi
+  for ip in $a4; do
+    if [[ $mine == *" $ip "* ]]; then good="$good $ip"; else other="$other $ip"; fi
+  done
+  if [ -n "$other" ]; then
+    pub=$(public_ip)
+    for ip in $other; do
+      if [ -n "$pub" ] && [ "$ip" = "$pub" ]; then good="$good $ip"; else rest="$rest $ip"; fi
+    done
+    other=$rest
+  fi
+  good=${good# }
+  other=${other# }
+  if [ -z "$other" ]; then
+    ok "$d points to this server ($good)"
+    SERVER_IP=${good%% *}
+  elif [ -z "$good" ] && [ -z "$pub" ]; then
+    warn "$d points to $other, but this script could not find this server's public IP to compare"
+    note "Make sure $other is the IP shown in your VPS provider's panel."
+    SERVER_IP=${other%% *}
+  elif [ -z "$good" ]; then
+    bad "$d points to $other, but this server is ${pub:-${mine// /}}"
+    note "Change the A record for $d to this server's IP, wait a few minutes, then run this again."
+  else
+    bad "$d has several A records: $good (this server) and $other (not this server)"
+    note "Delete the A records that don't point to this server."
+  fi
+  for ip in $a6; do
+    [[ $mine == *" $ip "* ]] || v6other="$v6other $ip"
+  done
+  if [ -n "$v6other" ]; then
+    warn "$d also has an AAAA (IPv6) record that is not on this server:$v6other"
+    note "Delete it. Let's Encrypt and other nodes may use the IPv6 address."
+  fi
+}
+
+# ---------- the new Let's Encrypt certificate ----------
+
+NEW_CERT_OK=0
+check_new_cert() { # mode: check | apply
+  NEW_LE_CERT=$LE/live/$NEW/fullchain.pem
+  NEW_LE_KEY=$LE/live/$NEW/privkey.pem
+  NEW_CERT_OK=0
+  if [ ! -f "$NEW_LE_CERT" ] || [ ! -f "$NEW_LE_KEY" ]; then
+    if [ "$1" = check ]; then todo "No SSL certificate for $NEW yet"; else bad "No SSL certificate for $NEW yet"; fi
+    note "Get it with: sudo bash switch-domain.sh cert $NEW"
+    return
+  fi
+  if ! cert_matches "$NEW_LE_CERT" "$NEW"; then
+    bad "The certificate in $LE/live/$NEW is not valid for $NEW"
+    return
+  fi
+  if ! cert_valid "$NEW_LE_CERT" 0; then
+    bad "The certificate for $NEW expired on $(cert_end "$NEW_LE_CERT")"
+    note "Renew it with: sudo certbot renew --cert-name $NEW"
+    return
+  fi
+  if ! key_matches "$NEW_LE_CERT" "$NEW_LE_KEY"; then
+    bad "The private key in $LE/live/$NEW does not belong to its certificate"
+    return
+  fi
+  ok "SSL certificate for $NEW is ready, valid until $(cert_end "$NEW_LE_CERT")"
+  NEW_CERT_OK=1
+}
+
+# ---------- planning the switch ----------
+
+other_cert_dir() { # the only other domain folder in /etc/redbelly/certs, if there is exactly one
+  local d name found="" n=0
+  for d in "$CERTS_ROOT"/*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    [ "$name" = "$NEW" ] && continue
+    valid_domain "$name" || continue
+    found=$name
+    n=$((n + 1))
+  done
+  [ "$n" -eq 1 ] && printf '%s' "$found"
+}
+
+candidate_files() {
+  local f
+  for f in "${UNIT_FILES[@]}"; do readlink -f "$f"; done
+  [ -d "$RB_ETC" ] && find "$RB_ETC" -path "$CERTS_ROOT" -prune -o -type f -print 2>/dev/null
+  [ -d "$LE/renewal-hooks" ] && find "$LE/renewal-hooks" -type f -print 2>/dev/null
+}
+
+renewal_covered() {
+  local f tdir
+  tdir=$(dirname "$TARGET_CERT")
+  [ "$LE_DIRECT" -eq 1 ] && return 0
+  [ -d "$LE/renewal-hooks" ] || return 1
+  while IFS= read -r f; do
+    if OLD_X=$OLD NEW_X=$NEW awk "$REPLACE_AWK" "$f" 2>/dev/null | grep -qF -- "$tdir"; then return 0; fi
+  done < <(find "$LE/renewal-hooks" -type f 2>/dev/null)
+  return 1
+}
+
+plan_switch() {
+  OLD=""
+  LE_DIRECT=0
+  NEED_COPY=0
+  EDIT_FILES=()
+  REF_DIR=""
+  REF_CERT=""
+  REF_KEY=""
+  TARGET_CERT=""
+  TARGET_KEY=""
+  if [ -z "$CUR_CERT" ] || [ -z "$CUR_KEY" ]; then
+    bad "The service file has no --tls.cert or --tls.key setting"
+    return 1
+  fi
+  if [[ $CUR_CERT != /* ]] || [[ $CUR_KEY != /* ]] || [[ $CUR_CERT$CUR_KEY == *'$'* ]]; then
+    bad "This script can't read the certificate paths in the service file: $CUR_CERT"
+    return 1
+  fi
+
+  # Which domain to replace
+  local dirname_cur
+  dirname_cur=$(basename "$(dirname "$CUR_CERT")")
+  if [ -n "$CUR_CN" ] && [ "$CUR_CN" != "$NEW" ]; then
+    OLD=$CUR_CN
+  elif [ -z "$CUR_CN" ] && [ "$dirname_cur" != "$NEW" ] && valid_domain "$dirname_cur"; then
+    OLD=$dirname_cur
+  else
+    OLD=$(other_cert_dir)
+  fi
+
+  # Where the node will read the new certificate from
+  if [ -n "$OLD" ]; then
+    TARGET_CERT=$(replace_in_string "$CUR_CERT")
+    TARGET_KEY=$(replace_in_string "$CUR_KEY")
+  else
+    TARGET_CERT=$CUR_CERT
+    TARGET_KEY=$CUR_KEY
+  fi
+  if [ "$TARGET_CERT" = "$TARGET_KEY" ]; then
+    bad "The service file uses the same file for the certificate and the key"
+    return 1
+  fi
+  case "$TARGET_CERT" in
+    "$LE"/*)
+      if [ "$(dirname "$TARGET_CERT")" = "$LE/live/$NEW" ] && [ "$(dirname "$TARGET_KEY")" = "$LE/live/$NEW" ]; then
+        LE_DIRECT=1
+      else
+        bad "The node reads its certificate from $(dirname "$TARGET_CERT"), which this script can't update"
+        note "See 'Other setups' in the guide."
+        return 1
+      fi
+      ;;
+  esac
+
+  # Files that will change
+  local f
+  if [ -n "$OLD" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if would_change "$f"; then EDIT_FILES+=("$f"); fi
+    done < <(candidate_files | sort -u)
+  fi
+
+  # Certificate files to install, and owner/permissions to copy
+  if [ "$LE_DIRECT" -eq 0 ]; then
+    if [ -f "$TARGET_CERT" ] && [ -f "$TARGET_KEY" ] && [ "$NEW_CERT_OK" -eq 1 ] && cmp -s "$NEW_LE_CERT" "$TARGET_CERT" && cmp -s "$NEW_LE_KEY" "$TARGET_KEY"; then
+      NEED_COPY=0
+    else
+      NEED_COPY=1
+    fi
+    [ -f "$CUR_CERT" ] && REF_CERT=$CUR_CERT
+    [ -f "$CUR_KEY" ] && REF_KEY=$CUR_KEY
+    [ -d "$(dirname "$CUR_CERT")" ] && REF_DIR=$(dirname "$CUR_CERT")
+    if [ -n "$OLD" ] && [ -d "$CERTS_ROOT/$OLD" ]; then
+      [ -n "$REF_CERT" ] || { [ -f "$CERTS_ROOT/$OLD/$(basename "$TARGET_CERT")" ] && REF_CERT=$CERTS_ROOT/$OLD/$(basename "$TARGET_CERT"); }
+      [ -n "$REF_KEY" ] || { [ -f "$CERTS_ROOT/$OLD/$(basename "$TARGET_KEY")" ] && REF_KEY=$CERTS_ROOT/$OLD/$(basename "$TARGET_KEY"); }
+      [ -n "$REF_DIR" ] || REF_DIR=$CERTS_ROOT/$OLD
+    fi
+  fi
+  return 0
+}
+
+nothing_to_change() { [ "$NEED_COPY" -eq 0 ] && [ ${#EDIT_FILES[@]} -eq 0 ]; }
+
+show_plan() {
+  if nothing_to_change; then
+    ok "The service file already uses the certificate for $NEW"
+    return
+  fi
+  [ -n "$OLD" ] && note "Old domain: $OLD"
+  if [ "$LE_DIRECT" -eq 1 ]; then
+    note "The node will read the certificate straight from $LE/live/$NEW"
+    if [ "$NEW_CERT_OK" -eq 1 ] && ! can_read_as "$SVC_USER" "$TARGET_KEY"; then
+      bad "User $SVC_USER can't read $TARGET_KEY"
+      note "See 'Other setups' in the guide."
+    fi
+  elif [ "$NEED_COPY" -eq 1 ]; then
+    note "New certificate goes to: $TARGET_CERT"
+    note "New key goes to:         $TARGET_KEY"
+  fi
+  if [ ${#EDIT_FILES[@]} -gt 0 ]; then
+    note "Files where $OLD becomes $NEW:"
+    local f
+    for f in "${EDIT_FILES[@]}"; do note "  $f"; done
+  fi
+  if renewal_covered; then
+    ok "Certificate renewals will keep the node's copy up to date"
+  else
+    warn "No certbot renewal hook copies renewed certificates to $(dirname "$TARGET_CERT")"
+    note "Let's Encrypt certificates last 90 days. After each renewal, run this script's apply command again."
+  fi
+}
+
+find_leftovers() { # folders named " that the first version of the guide created by mistake
+  find $HOME_DIRS -maxdepth 2 -type d -name '"' 2>/dev/null | sort -u
+}
+
+show_leftovers() {
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    warn "Leftover folder from the first version of this guide: $d"
+    note "It holds a copy of your certificate and key. Delete it with: sudo rm -r '$d'"
+  done < <(find_leftovers)
+}
+
+# ---------- node log and sync ----------
+
+# Log lines with the node's block: "current local block N" and "Sync request is sent to downloader, ID: X, from N"
+BLOCK_RE='current local block [0-9]+|downloader, ID: [0-9]+, from [0-9]+'
+local_block() { tail -n 20000 "$LOG" 2>/dev/null | grep -oE "$BLOCK_RE" | tail -n 1 | awk '{ print $NF }'; }
+local_block_time() { tail -n 20000 "$LOG" 2>/dev/null | grep -E "$BLOCK_RE" | tail -n 1 | grep -oE 'time=[^ ]+' | cut -d= -f2; }
+
+network_block() {
+  local out hex
+  out=$(curl -fsS --max-time 10 -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' "$RPC_URL" 2>/dev/null) || return 1
+  hex=$(printf '%s' "$out" | grep -oE '"result" *: *"0x[0-9a-fA-F]+"' | grep -oE '0x[0-9a-fA-F]+')
+  [ -n "$hex" ] && printf '%d' "$hex"
+}
+
+served_cert_cn() {
+  local pem
+  pem=$(timeout 8 openssl s_client -connect "127.0.0.1:$TLS_PORT" -servername "$NEW" -alpn h2 < /dev/null 2>/dev/null)
+  printf '%s' "$pem" | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null | awk -F'CN=' 'NF > 1 { print $2 }' | cut -d, -f1
+}
+
+# "received 0 responses" lines since the node last started (within the last 2000 log lines)
+zero_responses() { tail -n 2000 "$LOG" 2>/dev/null | awk '/SEVM Node Started/ { n = 0 } /received 0 responses/ { n++ } END { print n + 0 }'; }
+
+show_sync() {
+  local lb lt nb age="" ts
+  lb=$(local_block)
+  lt=$(local_block_time)
+  nb=$(network_block)
+  if [ -n "$lt" ]; then
+    ts=$(date -d "$lt" +%s 2>/dev/null)
+    [ -n "$ts" ] && age=$(( ($(date +%s) - ts) / 60 ))
+  fi
+  if [ -z "$lb" ]; then
+    warn "No block number found in the node log yet ($LOG)"
+  else
+    note "Node block (from the log): $lb${age:+, logged $age min ago}"
+  fi
+  if [ -z "$nb" ]; then
+    warn "Could not read the network block from $RPC_URL"
+  else
+    note "Network block:             $nb"
+  fi
+  if [ -n "$lb" ] && [ -n "$nb" ]; then
+    if [ $((nb - lb)) -le 3 ]; then ok "The node is in sync with the network"
+    else warn "The node is $((nb - lb)) blocks behind. Run status again in a few minutes; the number should go up."; fi
+  fi
+  if [ -n "$age" ] && [ "$age" -gt 15 ]; then
+    warn "The node has not logged a new block for $age minutes"
+  fi
+  local z
+  z=$(zero_responses)
+  if [ "${z:-0}" -gt 0 ]; then
+    warn "The node is not getting answers from other nodes ('received 0 responses' $z times since it last started)"
+    note "Before the switch: if support has already changed your hostname, this is expected until you run apply."
+    note "After the switch: wait a few minutes. If it continues, ask Redbelly support to check your hostname."
+  fi
+}
+
+# ---------- support ticket ----------
+
+print_ticket() {
+  local old=${OLD:-<OLD_DOMAIN>} id=${NODE_ID:-<YOUR_NODE_ID>} ip=${SERVER_IP:-<YOUR_VPS_IP>}
+  echo
+  echo "------------- Support ticket text (copy everything between the lines) -------------"
+  echo "Subject: Hostname change for Node ID $id"
+  echo
+  echo "Hi team,"
+  echo
+  echo "My node (Node ID: $id) is registered with hostname $old."
+  echo "That domain has expired, so I have moved to $NEW, which points to the"
+  echo "same server IP $ip. Ports, vote/signing address and reward address"
+  echo "are unchanged."
+  echo
+  echo "Please update the registered hostname for my node to $NEW and let me"
+  echo "know when it is done, so I can switch my node to the new certificate."
+  echo "The switch needs a restart of about 1 minute."
+  echo
+  echo "Thanks"
+  echo "-----------------------------------------------------------------------------------"
+}
+
+# ---------- changing files ----------
+
+make_backup() {
+  BACKUP=$BACKUP_ROOT/rbn-backup-$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$BACKUP" || return 1
+  chmod 700 "$BACKUP"
+  local list=() f
+  for f in "${UNIT_FILES[@]}"; do list+=("$(readlink -f "$f")"); done
+  [ ${#EDIT_FILES[@]} -gt 0 ] && list+=("${EDIT_FILES[@]}")
+  [ -d "$RB_ETC" ] && list+=("$RB_ETC")
+  [ -d "$LE/renewal-hooks" ] && list+=("$LE/renewal-hooks")
+  for f in "$TARGET_CERT" "$TARGET_KEY"; do [ -e "$f" ] && list+=("$f"); done
+  BACKUP_ITEMS=()
+  # Unique paths, without files that are already inside a folder on the list
+  while IFS= read -r f; do BACKUP_ITEMS+=("$f"); done < <(for f in "${list[@]}"; do echo "$f"; done | LC_ALL=C sort -u | awk '{ for (i = 1; i <= n; i++) if (index($0, k[i] "/") == 1) next; k[++n] = $0; print }')
+  cp -a --parents "${BACKUP_ITEMS[@]}" "$BACKUP"/ || return 1
+  # Each item is copied back to its own folder. Never copy the backup folder itself onto /.
+  {
+    echo "#!/bin/bash"
+    echo "# Written by switch-domain.sh: puts back the files saved in $BACKUP, then restarts the node."
+    for f in "${BACKUP_ITEMS[@]}"; do echo "cp -a '$BACKUP$f' '$(dirname "$f")/'"; done
+    echo "systemctl daemon-reload"
+    echo "systemctl restart $SERVICE"
+    echo "echo 'Restored the files from $BACKUP and restarted $SERVICE.'"
+  } > "$BACKUP/restore.sh"
+}
+
+restore_backup() {
+  local f ok=1
+  for f in "${BACKUP_ITEMS[@]}"; do cp -a "$BACKUP$f" "$(dirname "$f")/" || ok=0; done
+  if [ "$ok" -eq 1 ]; then
+    echo "  Restored all files from $BACKUP. The node was not restarted and runs as before."
+  else
+    echo "  Could not restore every file. Run: sudo bash $BACKUP/restore.sh"
+  fi
+}
+
+put_file() { # source target reference fallback_mode
+  local tmp="$2.switch-domain-tmp"
+  cp -L "$1" "$tmp" || return 1
+  if [ -n "$3" ] && [ -e "$3" ]; then
+    chown --reference="$3" "$tmp" && chmod --reference="$3" "$tmp" || return 1
+  else
+    chown "root:$SVC_GROUP" "$tmp" && chmod "$4" "$tmp" || return 1
+  fi
+  mv -f "$tmp" "$2"
+}
+
+install_cert_files() {
+  local d
+  for d in "$(dirname "$TARGET_CERT")" "$(dirname "$TARGET_KEY")"; do
+    [ -d "$d" ] && continue
+    mkdir -p "$d" || return 1
+    if [ -n "$REF_DIR" ] && [ -d "$REF_DIR" ]; then
+      chown --reference="$REF_DIR" "$d" && chmod --reference="$REF_DIR" "$d" || return 1
+    else
+      chown "root:$SVC_GROUP" "$d" && chmod 750 "$d" || return 1
+    fi
+  done
+  put_file "$NEW_LE_CERT" "$TARGET_CERT" "$REF_CERT" 644 || return 1
+  put_file "$NEW_LE_KEY" "$TARGET_KEY" "$REF_KEY" 640 || return 1
+  ok "Installed the new certificate in $(dirname "$TARGET_CERT")"
+}
+
+edit_files() {
+  local f tmp rc
+  for f in "${EDIT_FILES[@]}"; do
+    tmp=$(mktemp) || return 1
+    OLD_X=$OLD NEW_X=$NEW awk "$REPLACE_AWK" "$f" > "$tmp"
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then rm -f "$tmp"; return 1; fi
+    cat "$tmp" > "$f" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    ok "Updated $f"
+  done
+}
+
+verify_switch() {
+  local c k f
+  c=$(flag_value tls.cert)
+  k=$(flag_value tls.key)
+  if [ "$c" != "$TARGET_CERT" ] || [ "$k" != "$TARGET_KEY" ]; then
+    bad "The service file does not point to the new certificate ($c)"
+    return 1
+  fi
+  if ! cert_matches "$c" "$NEW" || ! key_matches "$c" "$k"; then
+    bad "The certificate or key at the new location is not right"
+    return 1
+  fi
+  if ! can_read_as "$SVC_USER" "$c" || ! can_read_as "$SVC_USER" "$k"; then
+    bad "User $SVC_USER can't read the new certificate or key"
+    return 1
+  fi
+  if [ ${#EDIT_FILES[@]} -gt 0 ]; then
+    for f in "${EDIT_FILES[@]}"; do
+      if would_change "$f"; then bad "The old domain is still in $f"; return 1; fi
+    done
+  fi
+  ok "Checked: the service file points to the certificate for $NEW and user $SVC_USER can read it"
+}
+
+restart_node() {
+  local size blk="" state
+  size=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+  systemctl daemon-reload
+  systemctl reset-failed "$SERVICE" >/dev/null 2>&1
+  if ! systemctl restart "$SERVICE"; then
+    bad "systemctl restart $SERVICE failed"
+    return 1
+  fi
+  printf '  Restarted. Waiting for the node to start (up to 3 minutes) '
+  for _ in $(seq 1 36); do
+    sleep 5
+    printf '.'
+    if systemctl is-failed --quiet "$SERVICE"; then break; fi
+    blk=$(tail -c +$((size + 1)) "$LOG" 2>/dev/null | grep -oE "$BLOCK_RE" | tail -n 1 | awk '{ print $NF }')
+    [ -n "$blk" ] && break
+  done
+  echo
+  state=$(systemctl is-active "$SERVICE" 2>/dev/null)
+  if [ -n "$blk" ] && [ "$blk" -ge 1000 ]; then
+    ok "The node started and continues from block $blk (no resync)"
+  elif [ -n "$blk" ]; then
+    warn "The node started from block $blk, near the start of the chain"
+    note "This script never touches the chain data. If the node was synced before, ask Redbelly support before you do anything else."
+  elif [ "$state" = active ]; then
+    warn "The node is running but has not logged a block number yet"
+    note "Check again in a few minutes with: sudo bash switch-domain.sh status $NEW"
+  else
+    bad "The node is not running (state: ${state:-unknown})"
+    note "Last lines of the error log ($ERRLOG):"
+    tail -n 15 "$ERRLOG" 2>/dev/null | sed 's/^/          /'
+    note "More details: sudo journalctl -u $SERVICE -n 50 --no-pager"
+    note "To undo the switch: sudo bash $BACKUP/restore.sh"
+    return 1
+  fi
+}
+
+confirm() {
+  local ans=""
+  echo
+  echo "Redbelly support must already have confirmed that your node's hostname is now $NEW."
+  read -r -p "Type yes to switch the node now (it restarts for about 1 minute): " ans < /dev/tty
+  [ "$ans" = yes ]
+}
+
+# ---------- commands ----------
+
+cmd_check() {
+  section "Node setup"
+  read_setup || die "Nothing to check."
+  show_setup
+  section "New domain: $NEW"
+  check_dns "$NEW"
+  check_new_cert check
+  section "Switch plan"
+  plan_switch && show_plan
+  section "Node log"
+  show_sync
+  show_leftovers
+  section "Result"
+  if [ "$FAILS" -gt 0 ]; then
+    echo "  Fix the FAIL items above, then run this check again."
+  elif [ "$NEW_CERT_OK" -eq 0 ]; then
+    echo "  Next: get the SSL certificate (the node keeps running):"
+    echo "    sudo bash switch-domain.sh cert $NEW"
+  elif nothing_to_change; then
+    echo "  This node is already set up for $NEW. To see if it is syncing:"
+    echo "    sudo bash switch-domain.sh status $NEW"
+  else
+    print_ticket
+    echo
+    echo "  Next: send the ticket above to Redbelly support. As soon as they confirm the change, run:"
+    echo "    sudo bash switch-domain.sh apply $NEW"
+  fi
+}
+
+cmd_cert() {
+  if [ -n "$EMAIL" ] && [[ $EMAIL != *@*.* ]]; then die "'$EMAIL' is not an email address."; fi
+  section "SSL certificate for $NEW"
+  NEW_LE_CERT=$LE/live/$NEW/fullchain.pem
+  NEW_LE_KEY=$LE/live/$NEW/privkey.pem
+  check_dns "$NEW"
+  [ "$FAILS" -eq 0 ] || die "Fix DNS first. Let's Encrypt blocks new attempts for an hour after 5 failures."
+  if [ -f "$NEW_LE_CERT" ] && cert_matches "$NEW_LE_CERT" "$NEW" && cert_valid "$NEW_LE_CERT" 2592000 && key_matches "$NEW_LE_CERT" "$NEW_LE_KEY"; then
+    ok "You already have a certificate for $NEW, valid until $(cert_end "$NEW_LE_CERT")"
+  else
+    have certbot || die "certbot is not installed. Install it with: sudo apt update && sudo apt install -y certbot"
+
+    local line proc names hook_stop="" hook_start="" svc=""
+    line=""
+    have ss && line=$(ss -Hltnp 'sport = :80' 2>/dev/null | head -n 1)
+    if [ -z "$line" ]; then
+      ok "Port 80 is free"
+    else
+      proc=$(printf '%s' "$line" | grep -oE '[(][(]"[^"]+"' | head -n 1 | cut -d'"' -f2)
+      case "$proc" in
+        docker-proxy|docker)
+          names=$(docker ps --filter publish=80 --format '{{.Names}}' 2>/dev/null)
+          if [ -n "$names" ] && [ "$(printf '%s' "$names" | grep -c .)" -eq 1 ]; then
+            hook_stop="docker stop $names"
+            hook_start="docker start $names"
+            ok "Port 80 is used by Docker container $names. It will be stopped for a few seconds."
+          else
+            die "Port 80 is used by Docker. Stop that container, run this command again, then start the container."
+          fi
+          ;;
+        "")
+          die "Something is using port 80 and the script can't tell what. Free port 80, then run this again."
+          ;;
+        *)
+          if systemctl is-active --quiet "$proc"; then
+            svc=$proc
+            hook_stop="systemctl stop $proc"
+            hook_start="systemctl start $proc"
+            ok "Port 80 is used by $proc. Certbot will stop it for a few seconds and start it again, also at every renewal."
+          else
+            die "Port 80 is used by $proc, which this script can't stop. Stop it, run this again, then start it."
+          fi
+          ;;
+      esac
+    fi
+    if have ufw && ufw status 2>/dev/null | head -n 1 | grep -q 'Status: active'; then
+      if ufw status 2>/dev/null | grep -qE '^80(/tcp)?[[:space:]].*ALLOW'; then
+        ok "The firewall (ufw) allows port 80"
+      else
+        warn "The firewall (ufw) is active and may block port 80. If certbot times out, run: sudo ufw allow 80"
+      fi
+    fi
+
+    local args=(certonly --standalone -d "$NEW" --non-interactive --agree-tos --keep-until-expiring)
+    if [ -n "$EMAIL" ]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
+    if [ -n "$hook_stop" ]; then args+=(--pre-hook "$hook_stop" --post-hook "$hook_start"); fi
+    echo
+    echo "  Running certbot..."
+    certbot "${args[@]}"
+    echo
+    if [ -n "$svc" ] && ! systemctl is-active --quiet "$svc"; then
+      warn "$svc did not start again after certbot. This does not affect the Redbelly node."
+      note "See why with: sudo journalctl -u $svc -n 30 --no-pager"
+    fi
+    check_new_cert apply
+    if [ "$NEW_CERT_OK" -ne 1 ]; then
+      note "Common causes: the domain does not point to this server yet, port 80 is closed in a"
+      note "firewall (ufw or your VPS provider's firewall), or a Cloudflare proxy (orange cloud) is on."
+      die "No certificate yet. Fix the cause above and run this command again."
+    fi
+  fi
+
+  FAILS=0
+  if read_setup >/dev/null; then
+    if [ -n "$CUR_CN" ] && [ "$CUR_CN" != "$NEW" ]; then OLD=$CUR_CN; else OLD=""; fi
+  fi
+  print_ticket
+  echo
+  echo "  Next: send the ticket above to Redbelly support. As soon as they confirm the change, run:"
+  echo "    sudo bash switch-domain.sh apply $NEW"
+}
+
+cmd_apply() {
+  section "Node setup"
+  read_setup || die "Nothing was changed."
+  show_setup
+  section "New domain: $NEW"
+  check_dns "$NEW"
+  check_new_cert apply
+  section "Switch plan"
+  plan_switch && show_plan
+  [ "$FAILS" -eq 0 ] || die "Nothing was changed. Fix the FAIL items above, then run apply again."
+
+  if nothing_to_change; then
+    if systemctl is-active --quiet "$SERVICE" && [ "$(served_cert_cn)" = "$NEW" ]; then
+      section "Result"
+      ok "Nothing to change: the node already runs with the certificate for $NEW"
+      section "Sync"
+      show_sync
+      return
+    fi
+    note "The files are already updated, but the running node still needs a restart."
+  fi
+
+  confirm || die "Cancelled. Nothing was changed."
+  section "Switching"
+  make_backup || die "Could not create the backup. Nothing was changed."
+  ok "Backup of the current files: $BACKUP"
+  if [ "$NEED_COPY" -eq 1 ]; then
+    install_cert_files || { restore_backup; die "Could not install the certificate."; }
+  fi
+  edit_files || { restore_backup; die "Could not update the files."; }
+  verify_switch || { restore_backup; die "The check after the changes failed."; }
+  restart_node || die "The node did not start. See above."
+  section "Sync"
+  show_sync
+  section "Next steps"
+  echo "  1. Check again in 10-15 minutes: sudo bash switch-domain.sh status $NEW"
+  if [ -n "$OLD" ] && [ -d "$LE/live/$OLD" ]; then
+    echo "  2. When the node is syncing, delete the old certificate: sudo certbot delete --cert-name $OLD"
+  fi
+  echo "  To undo the switch: sudo bash $BACKUP/restore.sh"
+  echo "  The backup folder contains a copy of your keys. Delete it after a few days: sudo rm -r $BACKUP"
+  show_leftovers
+}
+
+cmd_status() {
+  section "Node status"
+  read_setup || die "Nothing to check."
+  local state since served
+  state=$(systemctl is-active "$SERVICE" 2>/dev/null)
+  if [ "$state" = active ]; then
+    since=$(systemctl show -p ActiveEnterTimestamp --value "$SERVICE" 2>/dev/null)
+    ok "$SERVICE is running${since:+ (since $since)}"
+  else
+    bad "$SERVICE is not running (state: ${state:-unknown})"
+    note "Last lines of the error log ($ERRLOG):"
+    tail -n 10 "$ERRLOG" 2>/dev/null | sed 's/^/          /'
+  fi
+  if [ "$CUR_CN" = "$NEW" ]; then
+    ok "The service file uses the certificate for $NEW, valid until $(cert_end "$CUR_CERT")"
+  else
+    bad "The service file uses the certificate for ${CUR_CN:-a missing file}, not $NEW"
+    note "Run: sudo bash switch-domain.sh apply $NEW"
+  fi
+  if [ "$state" = active ]; then
+    served=$(served_cert_cn)
+    if [ "$served" = "$NEW" ]; then ok "The node serves the certificate for $NEW on port $TLS_PORT"
+    elif [ -n "$served" ]; then bad "The node still serves the certificate for $served on port $TLS_PORT"; note "Run: sudo bash switch-domain.sh apply $NEW"
+    else warn "Could not read the certificate on port $TLS_PORT (the node may still be starting)"; fi
+  fi
+  section "Sync"
+  show_sync
+  show_leftovers
+}
+
+# ---------- main ----------
+
+CMD=${1:-}
+NEW=$(normalize_domain "${2:-}")
+EMAIL=${3:-}
+case "$CMD" in check|cert|apply|status) ;; *) usage ;; esac
+[ -n "$NEW" ] || usage
+valid_domain "$NEW" || die "'${2:-}' is not a domain name. Use only the domain, like mynode.com"
+[ "$(id -u)" -eq 0 ] || die "Run it with sudo: sudo bash switch-domain.sh $CMD $NEW"
+have openssl || die "openssl is not installed. Install it with: sudo apt install -y openssl"
+echo "switch-domain.sh $VERSION: $CMD $NEW"
+"cmd_$CMD"
